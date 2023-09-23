@@ -7,6 +7,7 @@ import sys
 import numpy as np
 from torchnet.dataset import TensorDataset, ResampleDataset
 import pickle
+import scipy.io as sio
 
 def getMnistDataLoaders(batch_size, shuffle=True, device="cuda",data_path="./data"):
 	kwargs = {"num_workers":1, "pin_memory": True} if device == "cuda" else {}
@@ -108,3 +109,79 @@ def fmnist1V(transform=None):
 		)
 	return train_data, test_data
 
+
+def loadCsiNetDataset(data_path,env,category,debug):
+	if env=="indoor":
+		if category == "train":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Htrainin.mat"))
+		elif category == "val":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Hvalin.mat"))
+		elif category == "test":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Htestin.mat"))
+		else:
+			sys.exit("undefined dataset category {:}".format(category))
+	elif env == "outdoor":
+		if category == "train":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Htrainout.mat"))
+		elif category == "val":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Hvalout.mat"))
+		elif category == "test":
+			mat = sio.loadmat(os.path.join(data_path,"DATA_Htestout.mat"))
+		else:
+			sys.exit("undefined dataset category {:}".format(category))
+	else:
+		sys.exit("undefined environment, please choose from [indoor/outdoor]")
+	x_data = mat['HT']
+	
+	img_height = 32
+	img_width = 32
+	img_channels =2
+	img_total = img_height * img_width * img_channels
+	x_data = x_data.astype("float32")
+
+	#channel first
+
+	x_data = np.reshape(x_data, (len(x_data),img_channels,img_height,img_width))
+
+	# debugging, pick only 10 samples
+	if debug:
+		debug_num = 10 
+		x_data = x_data[:debug_num]
+	#print(x_data.shape)
+	#sys.exit()
+	return {
+		"x_data":x_data,
+		"height":img_height,
+		"width":img_width,
+		"channels":img_channels,
+		"format":"channels_first",
+	}
+
+class CsiNetDataset(Dataset):
+	def __init__(self,category=False,transform=None,target_transform=None,root_dir='./data',env="indoor",debug=False):
+		self.transform = transform
+		self.target_transform = target_transform
+		self.category = category
+		tx = transforms.ToTensor()
+		self.orig_dataset = torch.from_numpy(loadCsiNetDataset(root_dir,env,category,debug)['x_data'])
+	def __len__(self):
+		return len(self.orig_dataset)
+	def __getitem__(self,idx):
+		if torch.is_tensor(idx):
+			idx = idx.tolist()
+		x = self.orig_dataset[idx]
+		if self.transform:
+			x = self.transform(x)
+		return x
+
+def getCsiNetDataLoaders(batch_size, shuffle=True, device="cuda",data_path="./data",env="indoor",debug=False):
+	kwargs = {"num_workers":1, "pin_memory": True} if device == "cuda" else {}
+	#tx = transforms.ToTensor()
+	tx = None
+	train = DataLoader(CsiNetDataset(category="train",transform=tx,root_dir=data_path,env=env,debug=debug),
+						batch_size=batch_size, shuffle=shuffle, **kwargs)
+	valid = DataLoader(CsiNetDataset(category="val",transform=tx,root_dir=data_path,env=env,debug=debug),
+						batch_size=batch_size, shuffle=shuffle, **kwargs)
+	test = DataLoader(CsiNetDataset(category="test",transform=tx,root_dir=data_path,env=env,debug=debug),
+						batch_size=batch_size, shuffle=False, **kwargs)
+	return train, valid, test

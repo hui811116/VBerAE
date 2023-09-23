@@ -173,7 +173,7 @@ class VAE(VAEBase):
 class VBerAEBase(nn.Module):
 	def __init__(self,latent_dim,input_dim,device,**kwargs):
 		super().__init__()
-		self.training = True # training flag
+		#self.training = True # training flag
 		self.latent_dim = latent_dim
 		self.input_dim = input_dim
 		self.device = device
@@ -183,8 +183,12 @@ class VBerAEBase(nn.Module):
 		self.dec_stack = None
 		self.use_mse = False
 
-	def calc_loss(self,forward_out) -> dict:
+	def calc_loss(self,forward_out,**kwargs) -> dict:
+		xre_sigmoid = kwargs.get("sigmoid",False)
 		xre_logits = forward_out[0] # this is the same
+		if xre_sigmoid:
+			xre_logits = xre_logits.sigmoid()
+
 		x = forward_out[1] # this is the input, so the same
 		z_logits = forward_out[2] # this is the Ber logits
 		#z_soft = forward_out[3] # this is the soft-probabilities, for training only
@@ -194,14 +198,14 @@ class VBerAEBase(nn.Module):
 		kl_loss = torch.mean(torch.sum( np.log(2)+z_logits * z_logits.sigmoid() - F.softplus(z_logits),dim=1),dim=0)
 		# the reconstruction loss is the same
 		if self.use_mse:
-			bce_loss = F.mse_loss(xre_logits.view(-1,output_dim),x.view(-1,output_dim),reduction="none")
-			bce_loss = torch.mean(torch.sum(bce_loss,dim=1),dim=0)
+			rec_loss = F.mse_loss(xre_logits.view(-1,output_dim),x.view(-1,output_dim),reduction="none")
+			rec_loss = torch.mean(torch.sum(rec_loss,dim=1),dim=0)
 		else:
-			bce_loss = F.binary_cross_entropy_with_logits(xre_logits.view(-1,output_dim),x.view(-1,output_dim),reduction='none')
-			bce_loss = torch.mean(torch.sum(bce_loss,dim=1),dim=0)
+			rec_loss = F.binary_cross_entropy_with_logits(xre_logits.view(-1,output_dim),x.view(-1,output_dim),reduction='none')
+			rec_loss = torch.mean(torch.sum(rec_loss,dim=1),dim=0)
 		return {
-			"loss":bce_loss + kl_loss,
-			"reconstruction":bce_loss,
+			"loss":rec_loss + kl_loss,
+			"reconstruction":rec_loss,
 			"kl_divergence":kl_loss,
 			}
 
@@ -329,6 +333,161 @@ class VBerAE(VBerAEBase):
 		rec_shape = tuple([-1,self.hidden_layer_channels]+[int(item/4) for item in tmp_list])
 		zre_reshape = zre_flat.view(rec_shape)
 		xre = self.dec_cnn(zre_reshape)
+		if not self.use_mse:
+			xre = xre.sigmoid()
+		return [xre.detach(),zin.detach()]
+
+def residual_block(num_stack=2):
+	stack_list = nn.ModuleList()
+	for ii in range(num_stack):
+		stack = nn.Sequential(
+				nn.Conv2d(2,8,3,padding=1),
+				nn.BatchNorm2d(8),
+				nn.LeakyReLU(),
+				nn.Conv2d(8,16,3,padding=1),
+				nn.BatchNorm2d(16),
+				nn.LeakyReLU(),
+				nn.Conv2d(16,2,3,padding=1),
+			)
+		stack_list.append(stack)
+	return stack_list
+
+class VBerCsiNet(VBerAEBase):
+	def __init__(self,latent_dim,input_dim,device,**kwargs):
+		super(VBerCsiNet,self).__init__(latent_dim,input_dim,device)
+		self.use_mse = kwargs.get("use_mse",False)
+		# define some sub-class specific member
+		self.img_height=32
+		self.img_width = 32
+		self.img_channels =2
+		self.enc_stack = self.build_inproc_block()
+		self.enc_logits = nn.Linear(2048,latent_dim)
+		self.dec_resnet_list = residual_block(num_stack=2)
+		self.dec_stack = nn.Sequential(
+				nn.Linear(latent_dim,self.img_height*self.img_width*self.img_channels),
+				nn.BatchNorm1d(self.img_height*self.img_width*self.img_channels),
+				nn.LeakyReLU(),
+			)
+		self.dec_post_proc = nn.Sequential(
+				nn.Conv2d(2,2,3,stride=1,padding=1),
+			)
+	def build_inproc_block(self):
+		stack = nn.Sequential(
+				nn.Conv2d(2,2,3,stride=1,padding=1),
+				nn.BatchNorm2d(2),
+				nn.LeakyReLU(),
+			)
+		return stack
+	def resnet_pass(self,x):
+		for layer in self.dec_resnet_list:
+			shortcut = x
+			x = layer(x)
+			x = shortcut +x
+			x = F.leaky_relu(x)
+		return x
+	def forward(self,inputs):
+		x = self.enc_stack(inputs)
+		x = x.flatten(start_dim=1)
+		z_logits = self.enc_logits(x)
+		# bernoulli sampling
+		epsilon = torch.rand(size=z_logits.size()).to(self.device)
+		z_soft = torch.sigmoid(z_logits-epsilon.log()) # smooth surrogate
+		z_samp = torch.less(epsilon.log(),z_logits).float()
+		if self.training:
+			z = z_soft
+		else:
+			z = z_samp
+		# decoder
+		z = self.dec_stack(z) # to input shape
+		z = z.view((-1,self.img_channels,self.img_height,self.img_width))
+		# go through residual blocks
+		z = self.resnet_pass(z)
+		# post processing
+		xre_logits = self.dec_post_proc(z)
+		# output the logits, 
+		return [xre_logits,inputs,z_logits,z_soft,z_samp]
+	def decode(self,zin):
+		z = self.dec_stack(zin)
+		z = z.view((self.img_channels,self.img_height,self.img_width))
+		z = self.resnet_pass(z)
+		xre = self.dec_post_proc(z)
+		if not self.use_mse:
+			xre = xre.sigmoid()
+		return [xre.detach(),zin.detach()]
+
+
+# reproduce CsiNet results
+class CsiNet(nn.Module):
+	def __init__(self,latent_dim,input_dim,device,**kwargs):
+		super().__init__()
+		self.latent_dim = latent_dim
+		self.input_dim = input_dim
+		self.device = device
+		self.use_mse = kwargs.get("use_mse",False)
+		self.img_height=32
+		self.img_width = 32
+		self.img_channels =2
+		self.enc_stack = self.build_inproc_block()
+		self.enc_logits = nn.Linear(2048,latent_dim)
+		self.dec_resnet_list = residual_block(num_stack=2)
+		self.dec_stack = nn.Sequential(
+				nn.Linear(latent_dim,self.img_height*self.img_width*self.img_channels),
+				nn.BatchNorm1d(self.img_height*self.img_width*self.img_channels),
+				nn.LeakyReLU(),
+			)
+		self.dec_post_proc = nn.Sequential(
+				nn.Conv2d(2,2,3,stride=1,padding=1),
+			)
+	def build_inproc_block(self):
+		stack = nn.Sequential(
+				nn.Conv2d(2,2,3,stride=1,padding=1),
+				nn.BatchNorm2d(2),
+				nn.LeakyReLU(),
+			)
+		return stack
+	def resnet_pass(self,x):
+		for layer in self.dec_resnet_list:
+			shortcut = x
+			x = layer(x)
+			x = shortcut +x
+			x = F.leaky_relu(x)
+		return x
+	def forward(self,inputs):
+		x = self.enc_stack(inputs)
+		x = x.flatten(start_dim=1)
+		z = self.enc_logits(x)
+		z = self.dec_stack(z) # to input shape
+		z = z.view((-1,self.img_channels,self.img_height,self.img_width))
+		# go through residual blocks
+		z = self.resnet_pass(z)
+		# post processing
+		xre_logits = self.dec_post_proc(z)
+		# output the logits, 
+		return [xre_logits,inputs,z]
+	def calc_loss(self,forward_out,**kwargs):
+		use_sigmoid = kwargs.get("sigmoid",False)
+		xre = forward_out[0]
+		if use_sigmoid:
+			xre = xre.sigmoid()
+		xin = forward_out[1]
+		output_dim = np.prod(xin.size()[1:])
+		zin = forward_out[2]
+		if self.use_mse:
+			rec_loss = F.mse_loss(xre.view(-1,output_dim),xin.view(-1,output_dim),reduction="none")
+			rec_loss = torch.mean(torch.sum(rec_loss,dim=1),dim=0)
+		else:
+			rec_loss = F.binary_cross_entropy_with_logits(xre_logits.view(-1,output_dim),xin.view(-1,output_dim),reduction='none')
+			rec_loss = torch.mean(torch.sum(rec_loss,dim=1),dim=0)
+		return {
+			"loss":rec_loss,
+			"reconstruction":rec_loss,
+			}
+		return {}
+	def decode(self,zin):
+		z = self.dec_stack(zin)
+		z = z.view((self.img_channels,self.img_height,self.img_width))
+		z = self.resnet_pass(z)
+		xre = self.dec_post_proc(z)
 		if not self.use_mse:
 			xre = xre.sigmoid()
 		return [xre.detach(),zin.detach()]
